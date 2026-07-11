@@ -1,3 +1,26 @@
+#!/usr/bin/env bash
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$SCRIPT_DIR" || exit 1
+
+if [ ! -f .env ]; then
+    cp .env.example .env
+    echo "Created root .env from .env.example"
+fi
+
+set -a
+. ./.env
+set +a
+
+: "${DB_HOST:=mysql}"
+: "${MYSQL_DATABASE:=bagisto}"
+: "${MYSQL_TESTING_DATABASE:=bagisto_testing}"
+: "${MYSQL_USER:=root}"
+: "${MYSQL_PASSWORD:=root}"
+: "${MAIL_HOST:=mailpit}"
+: "${MAIL_PORT:=1025}"
+export DB_HOST MYSQL_DATABASE MYSQL_TESTING_DATABASE MYSQL_USER MYSQL_PASSWORD MAIL_HOST MAIL_PORT
+
 # function to check which docker compose command is available
 check_docker_compose() {
     if command -v docker-compose >/dev/null 2>&1; then
@@ -57,48 +80,70 @@ db_container_id=$(docker ps -aqf "name=mysql")
 
 # checking connection
 echo "Please wait... Waiting for MySQL connection..."
-while ! docker exec ${db_container_id} mysql --user=root --password=root -e "SELECT 1" >/dev/null 2>&1; do
+while ! docker exec -e MYSQL_PWD="${MYSQL_PASSWORD}" "${db_container_id}" mysql --user="${MYSQL_USER}" -e "SELECT 1" >/dev/null 2>&1; do
     sleep 1
 done
 
 # creating empty database for bagisto
 echo "Creating empty database for bagisto..."
-docker exec ${db_container_id} mysql --user=root --password=root -e "CREATE DATABASE IF NOT EXISTS bagisto CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+docker exec -e MYSQL_PWD="${MYSQL_PASSWORD}" "${db_container_id}" mysql --user="${MYSQL_USER}" -e "CREATE DATABASE IF NOT EXISTS \`${MYSQL_DATABASE}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 
 # creating empty database for bagisto testing
 echo "Creating empty database for bagisto testing..."
-docker exec ${db_container_id} mysql --user=root --password=root -e "CREATE DATABASE IF NOT EXISTS bagisto_testing CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+docker exec -e MYSQL_PWD="${MYSQL_PASSWORD}" "${db_container_id}" mysql --user="${MYSQL_USER}" -e "CREATE DATABASE IF NOT EXISTS \`${MYSQL_TESTING_DATABASE}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 
 # setting up bagisto
 echo "Now, setting up Bagisto..."
-docker exec ${php_container_id} git clone https://github.com/bagisto/bagisto
+docker exec "${php_container_id}" git clone https://github.com/bagisto/bagisto
 
 # setting bagisto stable version
 echo "Now, setting up Bagisto stable version..."
-docker exec -i ${php_container_id} bash -c "cd bagisto && git reset --hard v2.4.7"
+docker exec -i "${php_container_id}" bash -c "cd bagisto && git reset --hard v2.4.7"
 
 # installing composer dependencies inside container
-docker exec -i ${php_container_id} bash -c "cd bagisto && composer install"
+docker exec -i "${php_container_id}" bash -c "cd bagisto && composer install"
 
-# preparing .env (point DB at the mysql service and mail at mailpit)
-docker exec -i ${php_container_id} bash -c "cd bagisto && cp -n .env.example .env && sed -i \
-    -e 's/^DB_HOST=.*/DB_HOST=mysql/' \
-    -e 's/^DB_DATABASE=.*/DB_DATABASE=bagisto/' \
-    -e 's/^DB_USERNAME=.*/DB_USERNAME=root/' \
-    -e 's/^DB_PASSWORD=.*/DB_PASSWORD=root/' \
-    -e 's/^MAIL_HOST=.*/MAIL_HOST=mailpit/' \
-    -e 's/^MAIL_PORT=.*/MAIL_PORT=1025/' \
-    .env"
+# preparing Bagisto .env from the root runtime configuration
+docker exec -i \
+    -e BAGISTO_DB_HOST="${DB_HOST}" \
+    -e BAGISTO_DB_DATABASE="${MYSQL_DATABASE}" \
+    -e BAGISTO_DB_USERNAME="${MYSQL_USER}" \
+    -e BAGISTO_DB_PASSWORD="${MYSQL_PASSWORD}" \
+    -e BAGISTO_MAIL_HOST="${MAIL_HOST}" \
+    -e BAGISTO_MAIL_PORT="${MAIL_PORT}" \
+    "${php_container_id}" bash -c '
+        cd bagisto
+        cp -n .env.example .env
+
+        set_env() {
+            key="$1"
+            value="$2"
+            escaped_value=$(printf "%s\n" "$value" | sed "s/[\/&]/\\\\&/g")
+
+            if grep -q "^${key}=" .env; then
+                sed -i "s/^${key}=.*/${key}=${escaped_value}/" .env
+            else
+                printf "\n%s=%s\n" "$key" "$value" >> .env
+            fi
+        }
+
+        set_env DB_HOST "$BAGISTO_DB_HOST"
+        set_env DB_DATABASE "$BAGISTO_DB_DATABASE"
+        set_env DB_USERNAME "$BAGISTO_DB_USERNAME"
+        set_env DB_PASSWORD "$BAGISTO_DB_PASSWORD"
+        set_env MAIL_HOST "$BAGISTO_MAIL_HOST"
+        set_env MAIL_PORT "$BAGISTO_MAIL_PORT"
+    '
 
 # executing final commands
-docker exec -i ${php_container_id} bash -c "cd bagisto && php artisan bagisto:install --skip-env-check --skip-admin-creation --skip-github-star"
-docker exec -i ${php_container_id} bash -c 'cd bagisto && php artisan db:seed --class=Webkul\\Installer\\Database\\Seeders\\ProductTableSeeder'
+docker exec -i "${php_container_id}" bash -c "cd bagisto && php artisan bagisto:install --skip-env-check --skip-admin-creation --skip-github-star"
+docker exec -i "${php_container_id}" bash -c 'cd bagisto && php artisan db:seed --class=Webkul\\Installer\\Database\\Seeders\\ProductTableSeeder'
 
 # the steps above run as root, so make storage + bootstrap/cache writable by the
 # web server user (www-data), otherwise Laravel can't compile views / write cache
-docker exec -i ${php_container_id} bash -c "cd bagisto && chown -R www-data:www-data storage bootstrap/cache && chmod -R 775 storage bootstrap/cache"
+docker exec -i "${php_container_id}" bash -c "cd bagisto && chown -R www-data:www-data storage bootstrap/cache && chmod -R 775 storage bootstrap/cache"
 
 # restart the web server so it serves the freshly-installed app
 # (OpenLiteSpeed caches a vhost created before the docroot existed, and would
 # otherwise keep returning 404 until restarted)
-$COMPOSE restart $WEB_SERVICE
+$COMPOSE restart "$WEB_SERVICE"
